@@ -1,0 +1,13 @@
+# Template file for 'xlivebg'
+pkgname=xlivebg
+version=1.0
+revision=1
+build_style=gnu-configure
+hostmakedepends="libXrandr-devel libpng-devel libjpeg-turbo-devel libglvnd-devel
+ glu-devel ffmpeg-devel motif-devel wget"
+short_desc="live wallpapers for the X window system"
+maintainer="wael <40663@proton.me>"
+license="GPL-3.0-only"
+homepage="http://nuclear.mutantstargoat.com/sw/xlivebg/"
+distfiles="https://github.com/jtsiomb/xlivebg/archive/refs/tags/v${version}.tar.gz"
+checksum=58bc89d263f32c5ac69a86c99ad715d2a3e87a225f6803d247db6f4bda7d7064
