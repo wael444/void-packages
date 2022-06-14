@@ -1,0 +1,14 @@
+# Template file for 'ibus-table'
+pkgname=ibus-table
+version=1.16.9
+revision=1
+python_version=3
+build_style=gnu-configure
+hostmakedepends="gettext-tiny ibus-devel pkg-config"
+depends="ibus docbook2x aspell-en python3-enchant"
+short_desc="IM Engine framework for table-based input methods, such as ZhengMa, WuBi, ErBi, CangJie and so on"
+maintainer="wael <40663@proton.me>"
+license="LGPL-2.1-only"
+homepage="https://github.com/kaio/ibus-table"
+distfiles="https://github.com/kaio/ibus-table/releases/download/${version}/ibus-table-${version}.tar.gz"
+checksum=b80fdc9b8ba1ec7bac6fbdf2b990571a5f37f0533df61a2d94a13cd9edcac42c
