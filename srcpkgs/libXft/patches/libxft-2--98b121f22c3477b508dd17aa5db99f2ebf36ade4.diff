@@ -1,0 +1,949 @@
+diff -ur libxft-98b121f22c3477b508dd17aa5db99f2ebf36ade4/src/xftfreetype.c libxft-98b121f22c3477b508dd17aa5db99f2ebf36ade4-patched/src/xftfreetype.c
+--- libxft-98b121f22c3477b508dd17aa5db99f2ebf36ade4/src/xftfreetype.c	2021-08-02 02:49:42.000000000 +0200
++++ libxft-98b121f22c3477b508dd17aa5db99f2ebf36ade4-patched/src/xftfreetype.c	2022-01-18 08:52:34.951079483 +0100
+@@ -366,10 +366,10 @@
+ {
+     XftDisplayInfo  *info = _XftDisplayInfoGet (dpy, True);
+     FcChar8	    *filename;
+-    int		    id;
++    int		    id, mid;
+     double	    dsize;
+     double	    aspect;
+-    FcMatrix	    *font_matrix;
++    FcMatrix	    *font_matrix, fm1;
+     FcBool	    hinting, vertical_layout, autohint, global_advance;
+     int             hint_style;
+     FcChar32	    hash, *hashp;
+@@ -490,6 +490,21 @@
+ 	goto bail1;
+     }
+ 
++    mid = 1;
++    while (FcPatternGetMatrix (pattern, FC_MATRIX, mid, &font_matrix) == FcResultMatch) {
++	FcMatrixInit(&fm1);
++	fm1.xx = fi->matrix.xx / (double) 0x10000L;
++	fm1.yy = fi->matrix.yy / (double) 0x10000L;
++	fm1.xy = fi->matrix.xy / (double) 0x10000L;
++	fm1.yx = fi->matrix.yx / (double) 0x10000L;
++	FcMatrixMultiply(&fm1, font_matrix, &fm1);
++	fi->matrix.xx = (FT_Fixed)(0x10000L * fm1.xx);
++	fi->matrix.yy = (FT_Fixed)(0x10000L * fm1.yy);
++	fi->matrix.xy = (FT_Fixed)(0x10000L * fm1.xy);
++	fi->matrix.yx = (FT_Fixed)(0x10000L * fm1.yx);
++	mid++;
++    }
++
+     fi->transform = (fi->matrix.xx != 0x10000 || fi->matrix.xy != 0 ||
+ 		     fi->matrix.yx != 0 || fi->matrix.yy != 0x10000);
+ 
+@@ -523,7 +538,7 @@
+     /*
+      * Compute glyph load flags
+      */
+-    fi->load_flags = FT_LOAD_DEFAULT;
++    fi->load_flags = FT_LOAD_DEFAULT | FT_LOAD_COLOR;
+ 
+ #ifndef XFT_EMBEDDED_BITMAP
+ #define XFT_EMBEDDED_BITMAP "embeddedbitmap"
+@@ -775,6 +790,7 @@
+     FcChar32		hash_value;
+     FcChar32		rehash_value;
+     FcBool		antialias;
++    FcBool		color;
+     int			max_glyph_memory;
+     int			alloc_size;
+     int			ascent, descent, height;
+@@ -831,12 +847,18 @@
+     if (!(face->face_flags & FT_FACE_FLAG_SCALABLE))
+ 	antialias = FcFalse;
+ 
++    color = FT_HAS_COLOR(face) ? FcTrue : FcFalse;
++
+     /*
+      * Find the appropriate picture format
+      */
+     if (fi->render)
+     {
+-	if (antialias)
++	if (color)
++	{
++	    format = XRenderFindStandardFormat (dpy, PictStandardARGB32);
++	}
++	else if (antialias)
+ 	{
+ 	    switch (fi->rgba) {
+ 	    case FC_RGBA_RGB:
+@@ -968,6 +990,13 @@
+      * which doesn't happen in XftFontInfoFill
+      */
+     font->info.antialias = antialias;
++
++    /*
++     * Set color value, which is only known once the
++     * font was loaded
++     */
++    font->info.color = color;
++
+     /*
+      * bump XftFile reference count
+      */
+diff -ur libxft-98b121f22c3477b508dd17aa5db99f2ebf36ade4/src/xftglyphs.c libxft-98b121f22c3477b508dd17aa5db99f2ebf36ade4-patched/src/xftglyphs.c
+--- libxft-98b121f22c3477b508dd17aa5db99f2ebf36ade4/src/xftglyphs.c	2021-08-02 02:49:42.000000000 +0200
++++ libxft-98b121f22c3477b508dd17aa5db99f2ebf36ade4-patched/src/xftglyphs.c	2022-02-03 10:15:33.636126369 +0100
+@@ -26,6 +26,48 @@
+ 
+ #include FT_SYNTHESIS_H
+ 
++#include FT_GLYPH_H
++
++typedef double m3x3[3][3];
++
++static inline void
++m3x3_uniform(m3x3 m)
++{
++    m[0][0] = m[1][1] = m[2][2] = 1.0;
++    m[0][1] = m[1][0] = m[0][2] = m[1][2] = m[2][0] = m[2][1] = 0;
++}
++
++static inline void
++m3x3_transform(FT_Vector *v, m3x3 m)
++{
++    double x, y;
++
++    x = (double)v->x;
++    y = (double)v->y;
++    v->x = (FT_Pos)(x * m[0][0] + y * m[0][1] + m[0][2] + 0.5);
++    v->y = (FT_Pos)(x * m[1][0] + y * m[1][1] + m[1][2] + 0.5);
++}
++
++static inline void
++m3x3_invert(m3x3 m, m3x3 mi)
++{
++    double det;
++
++    det  = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]);
++    det -= m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]);
++    det += m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
++    det  = 1.0 / det;
++    mi[0][0] = det * (m[1][1] * m[2][2] - m[1][2] * m[2][1]);
++    mi[1][0] = det * (m[1][2] * m[2][0] - m[1][0] * m[2][2]);
++    mi[2][0] = det * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
++    mi[0][1] = det * (m[0][2] * m[2][1] - m[0][1] * m[2][2]);
++    mi[1][1] = det * (m[0][0] * m[2][2] - m[0][2] * m[2][0]);
++    mi[2][1] = det * (m[0][1] * m[2][0] - m[0][0] * m[2][1]);
++    mi[0][2] = det * (m[0][1] * m[1][2] - m[0][2] * m[1][1]);
++    mi[1][2] = det * (m[0][2] * m[1][0] - m[0][0] * m[1][2]);
++    mi[2][2] = det * (m[0][0] * m[1][1] - m[0][1] * m[1][0]);
++}
++
+ /*
+  * Validate the memory info for a font
+  */
+@@ -78,7 +120,9 @@
+ static int
+ _compute_xrender_bitmap_size( FT_Bitmap*	target,
+ 			      FT_GlyphSlot	slot,
+-			      FT_Render_Mode	mode )
++			      FT_Render_Mode	mode,
++			      FT_Matrix*	matrix,
++			      m3x3		m )
+ {
+     FT_Bitmap*	ftbit;
+     int		width, height, pitch;
+@@ -91,6 +135,63 @@
+ 
+     width = (int)ftbit->width;
+     height = (int)ftbit->rows;
++
++    if ( matrix && mode == FT_RENDER_MODE_NORMAL )
++    {
++	FT_Matrix mirror, inverse;
++	FT_Vector vector;
++	int xc, yc;
++	int left, right, top, bottom;
++
++	left = right = top = bottom = 0;
++	for (xc = 0; xc <= 1; xc++) {
++	    for (yc = 0; yc <= 1; yc++) {
++		vector.x = xc * width;
++		vector.y = yc * height;
++		FT_Vector_Transform(&vector, matrix);
++		if (xc == 0 && yc == 0) {
++		    left = right = (int)vector.x;
++		    top = bottom = (int)vector.y;
++		} else {
++		    if (left   > vector.x) left   = (int)vector.x;
++		    if (right  < vector.x) right  = (int)vector.x;
++		    if (bottom > vector.y) bottom = (int)vector.y;
++		    if (top    < vector.y) top    = (int)vector.y;
++		}
++	    }
++	}
++	width = (int)(right - left);
++	height = (int)(top - bottom);
++
++	mirror.xx = + 0x10000;
++	mirror.yy = - 0x10000;
++	mirror.xy = mirror.yx = 0;
++	inverse = *matrix;
++	FT_Matrix_Multiply(&mirror, &inverse);
++	FT_Matrix_Invert(&inverse);
++	FT_Matrix_Multiply(&mirror, &inverse);
++
++	vector.x = vector.y = 0;
++	FT_Vector_Transform(&vector, &inverse);
++	left = vector.x;
++	bottom = vector.y;
++	vector.x = width;
++	vector.y = height;
++	FT_Vector_Transform(&vector, &inverse);
++	right = vector.x;
++	top = vector.y;
++	left = (right - left) - (int)ftbit->width;
++	bottom = (top - bottom) - (int)ftbit->rows;
++
++	m[0][0] = (double)inverse.xx / 0x10000;
++	m[0][1] = (double)inverse.xy / 0x10000;
++	m[1][0] = (double)inverse.yx / 0x10000;
++	m[1][1] = (double)inverse.yy / 0x10000;
++	m[0][2] = (double)-left / 2;
++	m[1][2] = (double)-bottom / 2;
++	m[2][0] = m[2][1] = 0.0;
++	m[2][2] = 1.0;
++    }
+     pitch = (width+3) & ~3;
+ 
+     switch ( ftbit->pixel_mode )
+@@ -112,6 +213,10 @@
+ 	}
+ 	break;
+ 
++    case FT_PIXEL_MODE_BGRA:
++	pitch = width * 4;
++	break;
++
+     case FT_PIXEL_MODE_LCD:
+ 	if ( mode != FT_RENDER_MODE_LCD )
+ 	    return -1;
+@@ -143,6 +248,123 @@
+ }
+ 
+ /* this functions converts the glyph bitmap found in a FT_GlyphSlot
++ * into a different format while scaling by applying the given matrix
++ * (see _compute_xrender_bitmap_size)
++ *
++ * you should call this function after _compute_xrender_bitmap_size
++ *
++ * target :: target bitmap descriptor. Note that its 'buffer' pointer
++ *           must point to memory allocated by the caller
++ *
++ * source :: the source bitmap descriptor
++ *
++ * matrix :: the scaling matrix to apply
++ */
++static void
++_scaled_fill_xrender_bitmap( FT_Bitmap*	target,
++			     FT_Bitmap* source,
++			     m3x3 m )
++{
++    unsigned char*	src_buf	  = source->buffer;
++    unsigned char*	dst_line  = target->buffer;
++    int			src_pitch = source->pitch;
++    int			width     = target->width;
++    int			height    = target->rows;
++    int			pitch     = target->pitch;
++    int			i, x, y;
++    FT_Vector		vector, vector0;
++    int			sampling_width;
++    int			sampling_height;
++    int			sample_count;
++
++    if ( src_pitch < 0 )
++	src_buf -= src_pitch*(source->rows-1);
++
++    /* compute how many source pixels a target pixel spans */
++    vector.x = 1;
++    vector.y = 1;
++    m3x3_transform(&vector, m);
++    vector0.x = 0;
++    vector0.y = 0;
++    m3x3_transform(&vector0, m);
++    sampling_width = (vector.x - vector0.x) / 2;
++    sampling_height = (vector.y - vector0.y) / 2;
++    if (sampling_width < 0) sampling_width = -sampling_width;
++    if (sampling_height < 0) sampling_height = -sampling_height;
++    sample_count = (2 * sampling_width + 1) * (2 * sampling_height + 1);
++
++    for	( y = height; y > 0; y--, dst_line += pitch )
++    {
++	for ( x	= 0; x < width; x++ )
++	{
++	    unsigned char* src;
++
++	    /* compute target pixel location in source space */
++	    vector.x = x;
++	    vector.y = height - y;
++	    m3x3_transform(&vector, m);
++
++	    if (source->pixel_mode == FT_PIXEL_MODE_BGRA)
++	    {
++		if (vector.x < -sampling_width || vector.x > source->width + sampling_width)
++		    continue;
++		if (vector.y < -sampling_height || vector.y > source->rows + sampling_height)
++		    continue;
++	    }
++	    else
++	    {
++		if (vector.x < 0 || vector.x >= source->width)
++		    continue;
++		if (vector.y < 0 || vector.y >= source->rows)
++		    continue;
++	    }
++
++	    switch ( source->pixel_mode )
++	    {
++	    case FT_PIXEL_MODE_MONO: /* convert mono to 8-bit gray, scale using nearest pixel */
++		src = src_buf + (vector.y * src_pitch);
++		if ( src[(vector.x >> 3)] & (0x80 >> (vector.x & 7)) )
++		    dst_line[x] = 0xff;
++		break;
++
++	    case FT_PIXEL_MODE_GRAY: /* scale using nearest pixel */
++		src = src_buf + (vector.y * src_pitch);
++		dst_line[x] = src[vector.x];
++		break;
++
++	    case FT_PIXEL_MODE_BGRA: /* scale by averaging all relevant source pixels, keep BGRA format */
++	    {
++		int sample_x, sample_y;
++		int bgra[4] = { 0, 0, 0, 0 };
++
++		for (sample_y = - sampling_height; sample_y < sampling_height + 1; ++sample_y)
++		{
++		    int src_y = vector.y + sample_y;
++
++		    if (src_y < 0 || src_y >= source->rows)
++			continue;
++		    src = src_buf + (src_y * src_pitch);
++		    for (sample_x = - sampling_width; sample_x < sampling_width + 1; ++sample_x)
++		    {
++			int src_x = vector.x + sample_x;
++
++			if (src_x < 0 || src_x >= source->width)
++			    continue;
++			for (i = 0; i < 4; ++i)
++			    bgra[i] += src[src_x * 4 + i];
++		    }
++		}
++
++		for (i = 0; i < 4; ++i)
++		    dst_line[4 * x + i] = bgra[i] / sample_count;
++		break;
++	    }
++	    }
++	}
++    }
++}
++
++/* this functions converts the glyph bitmap found in a FT_GlyphSlot
+  * into a different format (see _compute_xrender_bitmap_size)
+  *
+  * you should call this function after _compute_xrender_bitmap_size
+@@ -166,15 +388,15 @@
+ 
+     {
+ 	unsigned char*	srcLine	= ftbit->buffer;
+-        unsigned char*	dstLine	= target->buffer;
+-        int		src_pitch = ftbit->pitch;
+-        int		width = (int)target->width;
+-        int		height = (int)target->rows;
+-        int		pitch = target->pitch;
+-        int		subpixel;
+-        int		h;
++	unsigned char*	dstLine	= target->buffer;
++	int		src_pitch = ftbit->pitch;
++	int		width = (int)target->width;
++	int		height = (int)target->rows;
++	int		pitch = target->pitch;
++	int		subpixel;
++	int		h;
+ 
+-        subpixel = ( mode == FT_RENDER_MODE_LCD ||
++	subpixel = ( mode == FT_RENDER_MODE_LCD ||
+ 		     mode == FT_RENDER_MODE_LCD_V );
+ 
+ 	if ( src_pitch < 0 )
+@@ -244,6 +466,11 @@
+ 	    }
+ 	    break;
+ 
++	case FT_PIXEL_MODE_BGRA: /* Preserve BGRA format */
++	    for ( h = height; h > 0; h--, srcLine += src_pitch, dstLine += pitch )
++		memcpy( dstLine, srcLine, width * 4 );
++	    break;
++
+ 	case FT_PIXEL_MODE_LCD:
+ 	    if ( !bgr )
+ 	    {
+@@ -363,8 +590,11 @@
+     FT_Bitmap*	    ftbit;
+     FT_Bitmap	    local;
+     FT_Vector	    vector;
++    m3x3	    m;
+     FT_Face	    face;
+     FT_Render_Mode  mode = FT_RENDER_MODE_MONO;
++    FcBool	    transform;
++    FcBool	    glyph_transform;
+ 
+     if (!info)
+ 	return;
+@@ -374,6 +604,8 @@
+     if (!face)
+ 	return;
+ 
++    if (font->info.color)
++	mode = FT_RENDER_MODE_NORMAL;
+     if (font->info.antialias)
+     {
+ 	switch (font->info.rgba) {
+@@ -390,6 +622,8 @@
+ 	}
+     }
+ 
++    transform = font->info.transform && mode != FT_RENDER_MODE_MONO;
++
+     while (nglyph--)
+     {
+ 	glyphindex = *glyphs++;
+@@ -440,29 +674,29 @@
+ 	/*
+ 	 * Compute glyph metrics from FreeType information
+ 	 */
+-	if(font->info.transform && glyphslot->format != FT_GLYPH_FORMAT_BITMAP)
++	if (transform)
+ 	{
+ 	    /*
+ 	     * calculate the true width by transforming all four corners.
+ 	     */
+ 	    int xc, yc;
+ 	    left = right = top = bottom = 0;
+-	    for(xc = 0; xc <= 1; xc ++) {
+-		for(yc = 0; yc <= 1; yc++) {
++	    for (xc = 0; xc <= 1; xc++) {
++		for (yc = 0; yc <= 1; yc++) {
+ 		    vector.x = glyphslot->metrics.horiBearingX + xc * glyphslot->metrics.width;
+ 		    vector.y = glyphslot->metrics.horiBearingY - yc * glyphslot->metrics.height;
+ 		    FT_Vector_Transform(&vector, &font->info.matrix);
+ 		    if (XftDebug() & XFT_DBG_GLYPH)
+ 			printf("Trans %d %d: %d %d\n", (int) xc, (int) yc,
+ 			       (int) vector.x, (int) vector.y);
+-		    if(xc == 0 && yc == 0) {
++		    if (xc == 0 && yc == 0) {
+ 			left = right = (int)vector.x;
+ 			top = bottom = (int)vector.y;
+ 		    } else {
+-			if(left	  > vector.x) left   = (int)vector.x;
+-			if(right  < vector.x) right  = (int)vector.x;
+-			if(bottom > vector.y) bottom = (int)vector.y;
+-			if(top	  < vector.y) top    = (int)vector.y;
++			if (left   > vector.x) left   = (int)vector.x;
++			if (right  < vector.x) right  = (int)vector.x;
++			if (bottom > vector.y) bottom = (int)vector.y;
++			if (top	   < vector.y) top    = (int)vector.y;
+ 		    }
+ 
+ 		}
+@@ -470,7 +704,7 @@
+ 	    left   = (int)FLOOR(left);
+ 	    right  = (int)CEIL(right);
+ 	    bottom = (int)FLOOR(bottom);
+-	    top	   = CEIL(top);
++	    top	   = (int)CEIL(top);
+ 
+ 	} else {
+ 	    left   = (int)FLOOR( glyphslot->metrics.horiBearingX );
+@@ -487,7 +721,7 @@
+ 	 * Clip charcell glyphs to the bounding box
+ 	 * XXX transformed?
+ 	 */
+-	if (font->info.spacing >= FC_CHARCELL && !font->info.transform)
++	if (font->info.spacing >= FC_CHARCELL && !transform)
+ 	{
+ 	    if (font->info.load_flags & FT_LOAD_VERTICAL_LAYOUT)
+ 	    {
+@@ -519,18 +753,20 @@
+ 	    }
+ 	}
+ 
++	glyph_transform = transform;
+ 	if ( glyphslot->format != FT_GLYPH_FORMAT_BITMAP )
+ 	{
+ 	    error = FT_Render_Glyph( face->glyph, mode );
+ 	    if (error)
+ 		continue;
++	    glyph_transform = False;
+ 	}
+ 
+ 	FT_Library_SetLcdFilter( _XftFTlibrary, FT_LCD_FILTER_NONE );
+ 
+ 	if (font->info.spacing >= FC_MONO)
+ 	{
+-	    if (font->info.transform)
++	    if (transform)
+ 	    {
+ 		if (font->info.load_flags & FT_LOAD_VERTICAL_LAYOUT)
+ 		{
+@@ -542,9 +778,9 @@
+ 		    vector.x = face->size->metrics.max_advance;
+ 		    vector.y = 0;
+ 		}
+-		FT_Vector_Transform (&vector, &font->info.matrix);
+-		xftg->metrics.xOff = (short)(vector.x >> 6);
+-		xftg->metrics.yOff = (short)(-(vector.y >> 6));
++		FT_Vector_Transform(&vector, &font->info.matrix);
++		xftg->metrics.xOff = (short)(TRUNC(ROUND(vector.x)));
++		xftg->metrics.yOff = (short)(TRUNC(ROUND(vector.y)));
+ 	    }
+ 	    else
+ 	    {
+@@ -613,14 +849,29 @@
+ 	    }
+ 	}
+ 
+-	size = _compute_xrender_bitmap_size( &local, glyphslot, mode );
++	m3x3_uniform(m);
++	size = _compute_xrender_bitmap_size( &local, glyphslot, mode, glyph_transform ? &font->info.matrix : NULL, m );
+ 	if ( size < 0 )
+ 	    continue;
+ 
+ 	xftg->metrics.width  = (unsigned short)local.width;
+ 	xftg->metrics.height = (unsigned short)local.rows;
+-	xftg->metrics.x      = (short)(- glyphslot->bitmap_left);
+-	xftg->metrics.y      = (short)(  glyphslot->bitmap_top);
++	if (glyph_transform)
++	{
++	    m3x3 mi;
++
++	    m3x3_invert(m, mi);
++	    vector.x = - glyphslot->bitmap_left;
++	    vector.y =   glyphslot->bitmap_top;
++	    m3x3_transform(&vector, mi);
++	    xftg->metrics.x = (short)vector.x;
++	    xftg->metrics.y = (short)vector.y;
++	}
++	else
++	{
++	    xftg->metrics.x = (short)(- glyphslot->bitmap_left);
++	    xftg->metrics.y = (short)(  glyphslot->bitmap_top);
++	}
+ 
+ 	/*
+ 	 * If the glyph is relatively large (> 1% of server memory),
+@@ -645,9 +896,12 @@
+ 
+ 	local.buffer = bufBitmap;
+ 
+-	_fill_xrender_bitmap( &local, glyphslot, mode,
+-			      (font->info.rgba == FC_RGBA_BGR ||
+-			       font->info.rgba == FC_RGBA_VBGR ) );
++	if (mode == FT_RENDER_MODE_NORMAL && glyph_transform)
++	    _scaled_fill_xrender_bitmap(&local, &glyphslot->bitmap, m);
++	else
++	    _fill_xrender_bitmap( &local, glyphslot, mode,
++				 (font->info.rgba == FC_RGBA_BGR ||
++				  font->info.rgba == FC_RGBA_VBGR) );
+ 
+ 	/*
+ 	 * Copy or convert into local buffer.
+@@ -662,6 +916,11 @@
+ 	 */
+ 	glyph = (Glyph) glyphindex;
+ 
++	if (xftg->picture)
++	{
++	    XRenderFreePicture(dpy, xftg->picture);
++	    xftg->picture = 0;
++	}
+ 	xftg->glyph_memory = (size_t)size + sizeof (XftGlyph);
+ 	if (font->format)
+ 	{
+@@ -685,15 +944,43 @@
+ 		    }
+ 		}
+ 	    }
+-	    else if ( mode != FT_RENDER_MODE_NORMAL )
++	    else if (glyphslot->bitmap.pixel_mode == FT_PIXEL_MODE_BGRA || mode != FT_RENDER_MODE_NORMAL)
+ 	    {
+ 		/* invert ARGB <=> BGRA */
+ 		if (ImageByteOrder (dpy) != XftNativeByteOrder ())
+ 		    XftSwapCARD32 ((CARD32 *) bufBitmap, size >> 2);
+ 	    }
+-	    XRenderAddGlyphs (dpy, font->glyphset, &glyph,
+-			      &xftg->metrics, 1,
+-			      (char *) bufBitmap, size);
++
++	    if (glyphslot->bitmap.pixel_mode == FT_PIXEL_MODE_BGRA)
++	    {
++		Pixmap pixmap = XCreatePixmap(dpy, DefaultRootWindow(dpy), local.width, local.rows, 32);
++		GC gc = XCreateGC(dpy, pixmap, 0, NULL);
++		XImage image = {
++		    local.width, local.rows, 0, ZPixmap, (char *)bufBitmap,
++		    dpy->byte_order, dpy->bitmap_unit, dpy->bitmap_bit_order, 32,
++		    32, local.width * 4 - local.pitch, 32,
++		    0, 0, 0
++		};
++
++		XInitImage(&image);
++		XPutImage(dpy, pixmap, gc, &image, 0, 0, 0, 0, local.width, local.rows);
++		xftg->picture = XRenderCreatePicture(dpy, pixmap, font->format, 0, NULL);
++
++		XFreeGC(dpy, gc);
++		XFreePixmap(dpy, pixmap);
++		/*
++		 * Record 256 times higher memory pressure for unrotated
++		 * pictures, and maximum for rotated pictures.
++		 */
++		if (font->info.matrix.xy || font->info.matrix.yx)
++		    xftg->glyph_memory += font->max_glyph_memory - size;
++		else
++		    xftg->glyph_memory += (size_t)size * 255;
++	    }
++	    else
++		XRenderAddGlyphs (dpy, font->glyphset, &glyph,
++				  &xftg->metrics, 1,
++				  (char *) bufBitmap, size);
+ 	}
+ 	else
+ 	{
+@@ -744,7 +1031,9 @@
+ 	{
+ 	    if (font->format)
+ 	    {
+-		if (font->glyphset)
++		if (xftg->picture)
++		    XRenderFreePicture(dpy, xftg->picture);
++		else if (font->glyphset)
+ 		{
+ 		    glyphBuf[nused++] = (Glyph) glyphindex;
+ 		    if (nused == sizeof (glyphBuf) / sizeof (glyphBuf[0]))
+@@ -754,11 +1043,8 @@
+ 		    }
+ 		}
+ 	    }
+-	    else
+-	    {
+-		if (xftg->bitmap)
+-		    free (xftg->bitmap);
+-	    }
++	    else if (xftg->bitmap)
++		free (xftg->bitmap);
+ 	    font->glyph_memory -= xftg->glyph_memory;
+ 	    if (info)
+ 		info->glyph_memory -= xftg->glyph_memory;
+@@ -796,6 +1082,7 @@
+ 	    XftMemAlloc (XFT_MEM_GLYPH, sizeof (XftGlyph));
+ 	    xftg->bitmap = NULL;
+ 	    xftg->glyph_memory = 0;
++	    xftg->picture = 0;
+ 	    font->glyphs[glyph] = xftg;
+ 	}
+ 	n = *nmissing;
+diff -ur libxft-98b121f22c3477b508dd17aa5db99f2ebf36ade4/src/xftint.h libxft-98b121f22c3477b508dd17aa5db99f2ebf36ade4-patched/src/xftint.h
+--- libxft-98b121f22c3477b508dd17aa5db99f2ebf36ade4/src/xftint.h	2021-08-02 02:49:42.000000000 +0200
++++ libxft-98b121f22c3477b508dd17aa5db99f2ebf36ade4-patched/src/xftint.h	2022-01-18 08:53:44.755581477 +0100
+@@ -85,6 +85,7 @@
+     XGlyphInfo	    metrics;
+     void	    *bitmap;
+     unsigned long   glyph_memory;
++    Picture         picture;
+ } XftGlyph;
+ 
+ /*
+@@ -134,6 +135,7 @@
+     FT_F26Dot6		xsize, ysize;	/* pixel size */
+     FcBool		antialias;	/* doing antialiasing */
+     FcBool		embolden;	/* force emboldening */
++    FcBool		color;		/* contains color glyphs */
+     int			rgba;		/* subpixel order */
+     int			lcd_filter;	/* lcd filter */
+     FT_Matrix		matrix;		/* glyph transformation matrix */
+diff -ur libxft-98b121f22c3477b508dd17aa5db99f2ebf36ade4/src/xftrender.c libxft-98b121f22c3477b508dd17aa5db99f2ebf36ade4-patched/src/xftrender.c
+--- libxft-98b121f22c3477b508dd17aa5db99f2ebf36ade4/src/xftrender.c	2021-08-02 02:49:42.000000000 +0200
++++ libxft-98b121f22c3477b508dd17aa5db99f2ebf36ade4-patched/src/xftrender.c	2022-01-18 08:55:12.476249549 +0100
+@@ -26,6 +26,35 @@
+ #define NUM_ELT_LOCAL	128
+ 
+ /*
++ * Dispatch glyph drawing to the correct XRenderCompositeString function
++ */
++static void
++_XftCompositeString (Display *dpy, int op, Picture src, Picture dst, XRenderPictFormat* format, GlyphSet glyphset, int srcx, int srcy, int dstx, int dsty, int charwidth, unsigned int* chars, int nchars)
++{
++    if (nchars == 0)
++        return;
++
++    switch (charwidth) {
++    case 1:
++    default:
++	XRenderCompositeString8 (dpy, op,
++				 src, dst, format, glyphset,
++				 srcx, srcy, dstx, dsty, (char*)chars, nchars);
++	break;
++    case 2:
++	XRenderCompositeString16(dpy, op,
++				 src, dst, format, glyphset,
++				 srcx, srcy, dstx, dsty, (unsigned short*)chars, nchars);
++	break;
++    case 4:
++	XRenderCompositeString32(dpy, op,
++				 src, dst, format, glyphset,
++				 srcx, srcy, dstx, dsty, (unsigned int*)chars, nchars);
++	break;
++    }
++}
++
++/*
+  * Use the Render extension to draw the glyphs
+  */
+ 
+@@ -43,12 +72,14 @@
+ 		int		nglyphs)
+ {
+     XftFontInt	    *font = (XftFontInt *) pub;
+-    int		    i;
++    int		    i, j;
+     FT_UInt	    missing[XFT_NMISSING];
+     int		    nmissing;
+     FT_UInt	    g, max;
+     int		    size, width;
++    int		    dstx, dsty;
+     Glyph	    wire;
++    XftGlyph*       glyph;
+     char	    *char8;
+     unsigned short  *char16;
+     unsigned int    *char32;
+@@ -100,43 +131,77 @@
+ 	if (!chars)
+ 	    goto bail1;
+     }
++    dstx = x;
++    dsty = y;
+     char8 = (char *) chars;
+     char16 = (unsigned short *) chars;
+     char32 = (unsigned int *) chars;
+-    for (i = 0; i < nglyphs; i++)
++    for (i = 0, j = 0; i < nglyphs; i++)
+     {
+ 	wire = (Glyph) glyphs[i];
+ 	if (wire >= font->num_glyphs || !font->glyphs[wire])
+ 	    wire = 0;
+-	switch (width) {
+-	case 1: char8[i] = (char) wire; break;
+-	case 2: char16[i] = (unsigned short) wire; break;
+-	case 4: char32[i] = (unsigned int) wire; break;
++        glyph = font->glyphs[wire];
++	if (glyph->picture)
++	{
++	    _XftCompositeString(dpy, op, src, dst, font->format, font->glyphset, srcx, srcy, x, y, width, chars, j);
++	    XRenderComposite(dpy, PictOpOver, glyph->picture, None, dst, 0, 0, 0, 0, dstx - glyph->metrics.x, dsty - glyph->metrics.y, glyph->metrics.width, glyph->metrics.height);
++	    dstx += glyph->metrics.xOff;
++	    dsty += glyph->metrics.yOff;
++	    x = dstx;
++	    y = dsty;
++	    j = 0;
++	}
++	else
++	{
++	    switch (width) {
++	    case 1: char8[j] = (char) wire; break;
++	    case 2: char16[j] = (unsigned short) wire; break;
++	    case 4: char32[j] = (unsigned int) wire; break;
++	    }
++	    dstx += glyph->metrics.xOff;
++	    dsty += glyph->metrics.yOff;
++	    ++j;
+ 	}
+     }
+-    switch (width) {
++    _XftCompositeString(dpy, op, src, dst, font->format, font->glyphset, srcx, srcy, x, y, width, chars, j);
++    if (chars != char_local)
++	free (chars);
++bail1:
++    if (glyphs_loaded)
++	_XftFontManageMemory (dpy, pub);
++}
++
++/*
++ * Dispatch glyph drawing to the correct XRenderCompositeText function
++ */
++static void
++_XftCompositeText (Display *dpy, int op, Picture src, Picture dst, XRenderPictFormat* format, int srcx, int srcy, int dstx, int dsty, int eltwidth, XGlyphElt8* elts, int nelt)
++{
++    if (nelt == 0)
++        return;
++
++    switch (eltwidth) {
+     case 1:
+     default:
+-	XRenderCompositeString8 (dpy, op,
+-				 src, dst, font->format, font->glyphset,
+-				 srcx, srcy, x, y, char8, nglyphs);
++	XRenderCompositeText8 (dpy, op,
++			       src, dst, format,
++			       srcx, srcy, dstx, dsty,
++	                       (XGlyphElt8*)elts, nelt);
+ 	break;
+     case 2:
+-	XRenderCompositeString16(dpy, op,
+-				 src, dst, font->format, font->glyphset,
+-				 srcx, srcy, x, y, char16, nglyphs);
++	XRenderCompositeText16(dpy, op,
++			       src, dst, format,
++			       srcx, srcy, dstx, dsty,
++	                       (XGlyphElt16*)elts, nelt);
+ 	break;
+     case 4:
+-	XRenderCompositeString32(dpy, op,
+-				 src, dst, font->format, font->glyphset,
+-				 srcx, srcy, x, y, char32, nglyphs);
++	XRenderCompositeText32(dpy, op,
++			       src, dst, format,
++			       srcx, srcy, dstx, dsty,
++	                       (XGlyphElt32*)elts, nelt);
+ 	break;
+     }
+-    if (chars != char_local)
+-	free (chars);
+-bail1:
+-    if (glyphs_loaded)
+-	_XftFontManageMemory (dpy, pub);
+ }
+ 
+ _X_EXPORT void
+@@ -251,9 +316,10 @@
+ 	    g = 0;
+ 	/*
+ 	 * check to see if the glyph is placed where it would
+-	 * fall using the normal spacing
++	 * fall using the normal spacing and if it would render
++	 * as a XRender glyph
+ 	 */
+-	if ((glyph = font->glyphs[g]))
++	if ((glyph = font->glyphs[g]) && !glyph->picture)
+ 	{
+ 	    if (x != glyphs[i].x || y != glyphs[i].y)
+ 	    {
+@@ -267,7 +333,7 @@
+     }
+ 
+     elts = elts_local;
+-    if (nelt > NUM_ELT_LOCAL)
++    if (!font->info.color && nelt > NUM_ELT_LOCAL)
+     {
+ 	elts = malloc ((size_t)nelt * sizeof (XGlyphElt8));
+ 	if (!elts)
+@@ -275,7 +341,7 @@
+     }
+ 
+     /*
+-     * Generate the list of glyph elts
++     * Generate the list of glyph elts or render color glyphs
+      */
+     nelt = 0;
+     x = y = 0;
+@@ -289,6 +355,11 @@
+ 	    g = 0;
+ 	if ((glyph = font->glyphs[g]))
+ 	{
++	    if (glyph->picture)
++	    {
++                XRenderComposite(dpy, PictOpOver, glyph->picture, None, dst, 0, 0, 0, 0, glyphs[i].x - glyph->metrics.x, glyphs[i].y - glyph->metrics.y, glyph->metrics.width, glyph->metrics.height);
++                continue;
++	    }
+ 	    if (!i || x != glyphs[i].x || y != glyphs[i].y)
+ 	    {
+ 		if (n)
+@@ -320,23 +391,9 @@
+ 	elts[nelt].nchars = n;
+ 	nelt++;
+     }
+-    switch (width) {
+-    case 1:
+-	XRenderCompositeText8 (dpy, op, src, dst, font->format,
+-			       srcx, srcy, glyphs[0].x, glyphs[0].y,
+-			       elts, nelt);
+-	break;
+-    case 2:
+-	XRenderCompositeText16 (dpy, op, src, dst, font->format,
+-				srcx, srcy, glyphs[0].x, glyphs[0].y,
+-				(XGlyphElt16 *) elts, nelt);
+-	break;
+-    case 4:
+-	XRenderCompositeText32 (dpy, op, src, dst, font->format,
+-				srcx, srcy, glyphs[0].x, glyphs[0].y,
+-				(XGlyphElt32 *) elts, nelt);
+-	break;
+-    }
++    _XftCompositeText(dpy, op, src, dst, font->format,
++		      srcx, srcy, glyphs[0].x, glyphs[0].y,
++		      width, elts, nelt);
+ 
+     if (elts != elts_local)
+ 	free (elts);
+@@ -535,7 +592,7 @@
+ 	 * check to see if the glyph is placed where it would
+ 	 * fall using the normal spacing
+ 	 */
+-	if ((glyph = font->glyphs[g]))
++	if ((glyph = font->glyphs[g]) && !glyph->picture)
+ 	{
+ 	    if (pub != prevPublic || x != glyphs[i].x || y != glyphs[i].y)
+ 	    {
+@@ -560,7 +617,7 @@
+     }
+ 
+     /*
+-     * Generate the list of glyph elts
++     * Generate the list of glyph elts and render color glyphs
+      */
+     nelt = 0;
+     x = y = 0;
+@@ -578,6 +635,11 @@
+ 	    g = 0;
+ 	if ((glyph = font->glyphs[g]))
+ 	{
++	    if (glyph->picture)
++	    {
++                XRenderComposite(dpy, PictOpOver, glyph->picture, None, dst, 0, 0, 0, 0, glyphs[i].x - glyph->metrics.x, glyphs[i].y - glyph->metrics.y, glyph->metrics.width, glyph->metrics.height);
++                continue;
++	    }
+ 	    if (!i || pub != prevPublic || x != glyphs[i].x || y != glyphs[i].y)
+ 	    {
+ 		if (n)
+@@ -610,23 +672,9 @@
+ 	elts[nelt].nchars = n;
+ 	nelt++;
+     }
+-    switch (width) {
+-    case 1:
+-	XRenderCompositeText8 (dpy, op, src, dst, format,
+-			       srcx, srcy, glyphs[0].x, glyphs[0].y,
+-			       elts, nelt);
+-	break;
+-    case 2:
+-	XRenderCompositeText16 (dpy, op, src, dst, format,
+-				srcx, srcy, glyphs[0].x, glyphs[0].y,
+-				(XGlyphElt16 *) elts, nelt);
+-	break;
+-    case 4:
+-	XRenderCompositeText32 (dpy, op, src, dst, format,
+-				srcx, srcy, glyphs[0].x, glyphs[0].y,
+-				(XGlyphElt32 *) elts, nelt);
+-	break;
+-    }
++    _XftCompositeText(dpy, op, src, dst, format,
++		      srcx, srcy, glyphs[0].x, glyphs[0].y,
++		      width, elts, nelt);
+ 
+     if (elts != elts_local)
+ 	free (elts);
