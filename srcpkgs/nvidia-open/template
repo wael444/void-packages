@@ -1,0 +1,45 @@
+# Template file for 'nvidia-open'
+pkgname=nvidia-open
+version=515.49.06
+revision=1
+wrksrc=open-gpu-kernel-modules-${version}
+depends="nvidia-open-dkms-${version}_${revision}"
+short_desc="NVIDIA open kernel modules"
+maintainer="wael <40663@proton.me>"
+license="GPL-2.0-only"
+homepage="https://github.com/NVIDIA/open-gpu-kernel-modules"
+changelog="https://github.com/NVIDIA/open-gpu-kernel-modules/blob/main/CHANGELOG.md"
+distfiles="https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/${version}.tar.gz"
+checksum=c83d461d9a1cedd1d596f1104fc9c0743bb6b46226dabd03b33f2e9e2a6536ee
+
+do_install() {
+	# dkms pkg
+	vmkdir usr/src/nvidia-open-${version}
+	vcopy "*" usr/src/nvidia-open-${version}
+	cp ${FILESDIR}/dkms.conf ${DESTDIR}/usr/src/nvidia-open-${version}/dkms.conf
+	sed -e "s/__VERSION_STRING/${version}/" \
+	    -e 's/__JOBS/$(nproc)/' \
+	    -i ${DESTDIR}/usr/src/nvidia-open-${version}/dkms.conf
+
+	# blacklist nouveau & allow unsupported gpus
+	vmkdir usr/lib/modprobe.d
+	echo "blacklist nouveau" > ${DESTDIR}/usr/lib/modprobe.d/nvidia.conf
+	echo "options nvidia NVreg_OpenRmEnableUnsupportedGpus=1" >> ${DESTDIR}/usr/lib/modprobe.d/nvidia.conf
+	chmod 644 ${DESTDIR}/usr/lib/modprobe.d/nvidia.conf
+
+	vdoc README.md
+}
+
+nvidia-open-dkms_package() {
+	short_desc="${_desc} - DKMS kernel module"
+	depends="dkms xbps-triggers>=0.121_1"
+	dkms_modules="nvidia-open ${version}"
+	# dkms must be before initramfs-regenerate to build modules before images
+	triggers="dkms initramfs-regenerate"
+	conflicts="nvidia-dkms>=0 nvidia470-dkms>=0 nvidia390-dkms>=0"
+
+	pkg_install() {
+		vmove usr/src
+		vmove usr/lib/modprobe.d
+	}
+}
