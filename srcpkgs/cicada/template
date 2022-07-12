@@ -1,0 +1,16 @@
+# Template file for 'cicada'
+pkgname=cicada
+version=0.9.30
+revision=1
+build_style=cargo
+short_desc="Simple Unix shell written in Rust"
+maintainer="wael <40663@proton.me>"
+license="MIT"
+homepage="https://github.com/mitnk/cicada"
+changelog="https://github.com/mitnk/cicada/blob/v${version}/CHANGELOG.md"
+distfiles="https://github.com/mitnk/cicada/archive/refs/tags/v${version}.tar.gz"
+checksum=c43e56e5c9b3bb7d8309dda06e7d7bdbbd9d6af6ec8de6a84faab51ad8afbf17
+
+post_install() {
+	vlicense LICENSE
+}
