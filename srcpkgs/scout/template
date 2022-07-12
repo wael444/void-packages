@@ -1,0 +1,16 @@
+# Template file for 'scout'
+pkgname=scout
+version=2.6.0
+revision=1
+build_style=cargo
+short_desc="Friendly fuzzy finder made in rust"
+maintainer="wael <40663@proton.me>"
+license="MIT"
+homepage="https://github.com/jhbabon/scout"
+changelog="https://github.com/jhbabon/scout/blob/v${version}/CONTRIBUTING.md"
+distfiles="https://github.com/jhbabon/scout/archive/refs/tags/v${version}.tar.gz"
+checksum=ce7683a3e29dba1ded2e7497bf32c3c3d9a697f6c0f8cde8fa19dce9e4bb38df
+
+post_install() {
+	vlicense LICENSE
+}
